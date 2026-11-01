@@ -51,13 +51,40 @@ class LegacyTableSync(TransformComponent):
             logger.info("LegacyTableSync: no nodes to sync, skipping.")
             return list(nodes)
 
+        # Check if there are any valid extracted nodes to sync
+        has_valid_extraction = any(
+            bool(n.metadata.get("letter_type") and n.metadata.get("description"))
+            for n in nodes
+        )
+        if not has_valid_extraction:
+            logger.warning(
+                "LegacyTableSync: no nodes contain valid extraction metadata "
+                "(letter_type and description). Skipping legacy sync to prevent "
+                "destructive clearing of existing records."
+            )
+            return list(nodes)
+
         # Generate description-based embeddings for LetterTypeMemory
         description_embeddings = await self._generate_description_embeddings(nodes)
 
+        # Collect source_doc_ids to scope signature deletions
+        source_doc_ids = [
+            n.metadata.get("source_doc_id")
+            for n in nodes
+            if n.metadata.get("source_doc_id")
+        ]
+
         async with AsyncSessionLocal() as session:
-            # Full re-sync: clear existing rows
+            # Delete only signatures belonging to the documents currently being ingested
+            if source_doc_ids:
+                await session.execute(
+                    delete(Signature).where(Signature.source_doc_id.in_(source_doc_ids))
+                )
+            else:
+                await session.execute(delete(Signature))
+
+            # Re-sync LetterTypeMemory with newly extracted records
             await session.execute(delete(LetterTypeMemory))
-            await session.execute(delete(Signature))
 
             existing_codes = await _load_existing_designations(session)
 
@@ -137,10 +164,10 @@ def _sync_to_legacy_tables(
         if not meta.get("letter_type"):
             continue
 
-        # 1. Designations (process first to pop 'incumbent' in place)
+        # 1. Designations (preserve approval_chain dict without popping incumbent)
         approval_chain = meta.get("approval_chain", [])
         for step in approval_chain:
-            incumbent = step.pop("incumbent", None)
+            incumbent = step.get("incumbent")
             desig_title = step.get("designation_title")
             if desig_title and desig_title not in existing_codes:
                 desg = Designation(

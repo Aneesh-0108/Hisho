@@ -104,7 +104,9 @@ class GoogleDocJsonParser(NodeParser):
             new_metadata["image_uris"] = image_uris
             new_metadata["full_markdown"] = markdown_text
 
+            stable_id = new_metadata.get("source_doc_id") or node.node_id
             text_node = TextNode(
+                id_=stable_id,
                 text=markdown_text,
                 metadata=new_metadata,
                 excluded_embed_metadata_keys=[
