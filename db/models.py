@@ -6,6 +6,8 @@ from sqlalchemy import (
     Text,
     Boolean,
     Integer,
+    BigInteger,
+    Identity,
     ForeignKey,
     JSON,
     DateTime,
@@ -152,6 +154,7 @@ class LetterTypeMemory(Base):
 
     __tablename__ = "letter_type_memory"
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    source_doc_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     letter_type: Mapped[str] = mapped_column(String, nullable=False)
     primary_domain: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -162,6 +165,21 @@ class LetterTypeMemory(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, nullable=False
     )
+
+
+class DataLetterNode(Base):
+    """Canonical store of historical reference letters and composite embeddings in PostgreSQL pgvector."""
+
+    __tablename__ = "data_letter_nodes"
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(always=False),
+        primary_key=True,
+    )
+    node_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    text: Mapped[str] = mapped_column(String, nullable=False)
+    metadata_: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(768), nullable=True)
 
 
 class Designation(Base):
