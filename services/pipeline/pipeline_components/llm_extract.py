@@ -25,7 +25,10 @@ from llama_index.llms.ollama import Ollama
 from llama_index.core.program import LLMTextCompletionProgram
 
 from config import settings
-from services.constants.letter_types import format_letter_types_block
+from services.constants.letter_types import (
+    format_letter_types_block,
+    normalize_canonical_category,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +209,7 @@ class LetterMetadataExtractor(BaseExtractor):
                     node.node_id,
                     _MAX_RETRIES,
                 )
-                metadata_list.append({})
+                metadata_list.append({"signature_extraction_status": "FAILED"})
                 continue
 
             # Map signature tokens back to actual image URIs from node metadata
@@ -215,12 +218,37 @@ class LetterMetadataExtractor(BaseExtractor):
                 extraction.signatures, image_uris
             )
 
+            # Determine explicit signature extraction status
+            existing_sig_status = node.metadata.get("signature_extraction_status")
+            if existing_sig_status:
+                sig_status = existing_sig_status
+            elif resolved_signatures and any(s.url for s in resolved_signatures):
+                sig_status = "SUCCESS"
+            else:
+                # Unverified / conservative: do not treat empty extraction as confirmed absence
+                sig_status = "UNVERIFIED"
+
+            # Normalize letter_type against canonical taxonomy
+            doc_title = node.metadata.get("tab_title") or node.metadata.get("title") or ""
+            try:
+                canonical_type = normalize_canonical_category(
+                    extraction.letter_type, document_title=doc_title
+                )
+            except ValueError as exc:
+                logger.error(
+                    "LetterMetadataExtractor: category normalization failed for node %s: %s",
+                    node.node_id,
+                    exc,
+                )
+                metadata_list.append({"signature_extraction_status": "FAILED"})
+                continue
+
             metadata_list.append(
                 {
                     "ref_no": extraction.ref_no,
                     "date": extraction.date,
                     "subject": extraction.subject,
-                    "letter_type": extraction.letter_type,
+                    "letter_type": canonical_type,
                     "primary_domain": extraction.primary_domain,
                     "description": extraction.description,
                     "table_info": extraction.table_info.model_dump() if extraction.table_info else None,
@@ -230,6 +258,7 @@ class LetterMetadataExtractor(BaseExtractor):
                     "signatures": [
                         sig.model_dump() for sig in resolved_signatures
                     ],
+                    "signature_extraction_status": sig_status,
                 }
             )
 

@@ -108,8 +108,12 @@ async def test_complete_extraction_failure_guard():
 
 
 @pytest.mark.asyncio
-async def test_partial_extraction_failure_deletes_global_letter_type_memory():
-    """Test 5: Partial extraction failure reveals that LetterTypeMemory is cleared globally."""
+async def test_partial_extraction_failure_scopes_deletions_to_successful_source_only():
+    """Test 5: Partial extraction failure scopes deletions strictly to the successful source,
+
+    guaranteeing that failures do not trigger global table wipes and unrelated source
+    records are completely preserved.
+    """
     good_node = TextNode(
         id_="doc_mix:tab_01",
         text="Good text",
@@ -119,6 +123,8 @@ async def test_partial_extraction_failure_deletes_global_letter_type_memory():
             "primary_domain": "INFRASTRUCTURE",
             "description": "Venue request",
             "approval_chain": [],
+            "signature_extraction_status": "SUCCESS",
+            "signatures": [{"url": "http://example.com/sig.png", "name": "Coordinator"}],
         },
     )
     failed_node = TextNode(
@@ -133,6 +139,7 @@ async def test_partial_extraction_failure_deletes_global_letter_type_memory():
 
     sync = LegacyTableSync()
     mock_session = AsyncMock()
+    mock_session.add = MagicMock()
 
     with patch("services.pipeline.pipeline_components.legacy_sync.AsyncSessionLocal") as mock_session_cls, \
          patch.object(sync, "_generate_description_embeddings", return_value=[[0.1] * 768, None]), \
@@ -142,6 +149,28 @@ async def test_partial_extraction_failure_deletes_global_letter_type_memory():
 
         await sync.acall([good_node, failed_node])
 
-        # Verify that delete was called on LetterTypeMemory globally (showing the wipe risk)
+        # Inspect all executed statements
         executed_statements = [str(call.args[0]) for call in mock_session.execute.call_args_list]
-        assert any("DELETE FROM letter_type_memory" in s for s in executed_statements)
+
+        # 1. Verify that NO unconstrained global deletion occurred
+        for stmt in executed_statements:
+            if "DELETE FROM" in stmt:
+                assert "WHERE" in stmt, f"Found unconstrained global delete: {stmt}"
+                assert "source_doc_id =" in stmt, f"Delete not scoped by source_doc_id: {stmt}"
+
+        # 2. Verify that deletion was executed ONLY for the successfully extracted source
+        ltm_deletes = [s for s in executed_statements if "DELETE FROM letter_type_memory" in s]
+        assert len(ltm_deletes) == 1, "Expected exactly 1 scoped LetterTypeMemory deletion"
+        assert "WHERE letter_type_memory.source_doc_id =" in ltm_deletes[0]
+
+        sig_deletes = [s for s in executed_statements if "DELETE FROM signatures" in s]
+        assert len(sig_deletes) == 1, "Expected exactly 1 scoped Signature deletion"
+        assert "WHERE signatures.source_doc_id =" in sig_deletes[0]
+
+        # 3. Verify that the failed node's source ID was NOT targeted for deletion
+        delete_calls = [call for call in mock_session.execute.call_args_list if "DELETE" in str(call.args[0])]
+        assert len(delete_calls) == 2  # 1 for Signature, 1 for LetterTypeMemory
+        for call in delete_calls:
+            params = call.args[0].compile().params
+            assert "doc_mix:tab_01" in params.values()
+            assert "doc_mix:tab_02" not in params.values()

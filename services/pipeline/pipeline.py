@@ -37,7 +37,7 @@ def build_pipeline() -> IngestionPipeline:
             GoogleDocJsonParser(),
             LetterMetadataExtractor(),
             LegacyTableSync(),
-            NodeTextFormatter(),
+            NodeTextFormatter(require_category=True),
             get_embed_model(),
         ],
         vector_store=get_pgvector_store(),

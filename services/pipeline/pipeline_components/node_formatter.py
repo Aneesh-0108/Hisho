@@ -1,8 +1,14 @@
 """TransformComponent that restructures node metadata and prepares composite text for embedding."""
 
+import logging
 from typing import Sequence
 
 from llama_index.core.schema import BaseNode, TransformComponent
+from pydantic import Field
+
+from services.constants.letter_types import normalize_canonical_category
+
+logger = logging.getLogger(__name__)
 
 
 def build_composite_searchable_text(
@@ -52,6 +58,14 @@ class NodeTextFormatter(TransformComponent):
       purpose/description, and body content for Ollama nomic-embed-text embedding.
     """
 
+    require_category: bool = Field(
+        default=False,
+        description="Whether to strictly require a valid canonical category on every node.",
+    )
+
+    def __init__(self, require_category: bool = False, **kwargs) -> None:
+        super().__init__(require_category=require_category, **kwargs)
+
     def __call__(self, nodes: Sequence[BaseNode], **kwargs) -> Sequence[BaseNode]:
         for node in nodes:
             # 1. Extract and resolve all metadata fields safely
@@ -64,9 +78,32 @@ class NodeTextFormatter(TransformComponent):
             table_info = node.metadata.get("table_info")
             approval_chain = node.metadata.get("approval_chain") or []
             signatures = node.metadata.get("signatures") or []
+            signature_extraction_status = node.metadata.get("signature_extraction_status")
             tab_title = node.metadata.get("tab_title") or ""
             source_doc_id = node.metadata.get("source_doc_id") or ""
             image_uris = node.metadata.get("image_uris") or []
+
+            doc_id_label = source_doc_id or node.node_id or "unknown_source"
+            doc_title = tab_title or node.metadata.get("title")
+
+            # Canonical category normalization:
+            # Reject invalid categories and raise a clear exception with document identity.
+            if letter_type or self.require_category:
+                try:
+                    letter_type = normalize_canonical_category(
+                        letter_type, document_title=doc_title
+                    )
+                except ValueError as exc:
+                    cat_label = f"'{letter_type}'" if letter_type else "<missing category>"
+                    logger.error(
+                        "NodeTextFormatter: category normalization failed for source '%s' with category %s: %s",
+                        doc_id_label,
+                        cat_label,
+                        exc,
+                    )
+                    raise ValueError(
+                        f"NodeTextFormatter: Invalid or missing category {cat_label} for document '{doc_id_label}': {exc}"
+                    ) from exc
 
             # Full original letter preservation: never sacrifice authentic text
             full_letter = (
@@ -87,6 +124,7 @@ class NodeTextFormatter(TransformComponent):
                 "table_info": table_info,
                 "approval_chain": approval_chain,
                 "signatures": signatures,
+                "signature_extraction_status": signature_extraction_status,
                 "full_letter": full_letter,
                 "full_markdown": full_letter,
                 "tab_title": tab_title,

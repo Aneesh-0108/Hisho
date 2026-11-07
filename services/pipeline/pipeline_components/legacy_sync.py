@@ -19,8 +19,67 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models import Designation, LetterTypeMemory, Signature
 from services.pipeline.pipeline_components.embed_model import get_embed_model
 from db.session import AsyncSessionLocal
+from services.constants.letter_types import CANONICAL_CATEGORY_IDS
 
 logger = logging.getLogger(__name__)
+
+
+def _evaluate_signature_state(node: BaseNode) -> tuple[str, list[dict[str, Any]]]:
+    """Evaluate signature extraction state for a node.
+
+    Distinguishes three states:
+      1. 'SUCCESS': Valid signature extraction with verified, non-empty signatures.
+         -> Atomically replace existing source signatures with new ones.
+      2. 'CONFIRMED_EMPTY': Confirmed document has zero signatures.
+         -> Atomically delete existing source signatures, insert nothing.
+      3. 'PRESERVE': Missing, failed, incomplete, or unverified extraction.
+         -> Preserve existing source signatures without deletion or mutation.
+    """
+    meta = node.metadata
+    status = meta.get("signature_extraction_status")
+    signatures = meta.get("signatures")
+
+    # State B: Explicitly confirmed zero signatures
+    if status == "CONFIRMED_EMPTY":
+        logger.info(
+            "LegacyTableSync: Confirmed zero signatures for node %s. Existing signatures will be cleared.",
+            node.node_id,
+        )
+        return "CONFIRMED_EMPTY", []
+
+    # State A: Successful extraction with signatures
+    if status == "SUCCESS":
+        if isinstance(signatures, list) and len(signatures) > 0:
+            valid_sigs: list[dict[str, Any]] = []
+            for s in signatures:
+                if isinstance(s, dict) and s.get("url") and isinstance(s["url"], str) and s["url"].strip():
+                    valid_sigs.append(s)
+                else:
+                    logger.warning(
+                        "LegacyTableSync: Incomplete signature record for node %s: %s. "
+                        "Treating as incomplete; preserving existing signatures.",
+                        node.node_id,
+                        s,
+                    )
+                    return "PRESERVE", []
+            return "SUCCESS", valid_sigs
+        else:
+            logger.warning(
+                "LegacyTableSync: Node %s has status='SUCCESS' but signatures list is empty or invalid. "
+                "Preserving existing signatures.",
+                node.node_id,
+            )
+            return "PRESERVE", []
+
+    # State C: Missing, failed, incomplete, or unverified extraction
+    logger.info(
+        "LegacyTableSync: Preserving existing signatures for node %s (status=%r, signatures=%s). "
+        "Extraction is unverified or incomplete.",
+        node.node_id,
+        status,
+        type(signatures).__name__ if signatures is not None else "None",
+    )
+    return "PRESERVE", []
 
 
 class LegacyTableSync(TransformComponent):
@@ -46,57 +105,123 @@ class LegacyTableSync(TransformComponent):
     async def acall(
         self, nodes: Sequence[BaseNode], **kwargs
     ) -> Sequence[BaseNode]:
-        """Sync nodes to legacy tables asynchronously."""
+        """Sync nodes to legacy tables asynchronously with source scoping and validation."""
         if not nodes:
             logger.info("LegacyTableSync: no nodes to sync, skipping.")
             return list(nodes)
 
-        # Check if there are any valid extracted nodes to sync
-        has_valid_extraction = any(
-            bool(n.metadata.get("letter_type") and n.metadata.get("description"))
-            for n in nodes
-        )
-        if not has_valid_extraction:
+        # Validate extraction completeness for each node
+        valid_indices: list[int] = []
+        for idx, node in enumerate(nodes):
+            meta = node.metadata or {}
+            source_doc_id = meta.get("source_doc_id")
+            if not source_doc_id and node.node_id and "#" in node.node_id:
+                source_doc_id = node.node_id
+
+            letter_type = meta.get("letter_type")
+            description = meta.get("description")
+            approval_chain = meta.get("approval_chain")
+
+            if (
+                source_doc_id
+                and isinstance(source_doc_id, str)
+                and source_doc_id.strip()
+                and letter_type
+                and letter_type in CANONICAL_CATEGORY_IDS
+                and description
+                and isinstance(description, str)
+                and description.strip()
+                and approval_chain is not None
+                and isinstance(approval_chain, list)
+            ):
+                valid_indices.append(idx)
+
+        if not valid_indices:
             logger.warning(
-                "LegacyTableSync: no nodes contain valid extraction metadata "
-                "(letter_type and description). Skipping legacy sync to prevent "
-                "destructive clearing of existing records."
+                "LegacyTableSync: no nodes contain valid, complete extraction metadata "
+                "(source_doc_id, canonical letter_type, description, approval_chain). "
+                "Skipping legacy sync to prevent destructive clearing of existing records."
             )
             return list(nodes)
 
-        # Generate description-based embeddings for LetterTypeMemory
-        description_embeddings = await self._generate_description_embeddings(nodes)
+        # Generate description-based embeddings for valid nodes
+        valid_nodes = [nodes[i] for i in valid_indices]
+        valid_embeddings = await self._generate_description_embeddings(valid_nodes)
 
-        # Collect source_doc_ids to scope signature deletions
-        source_doc_ids = [
-            n.metadata.get("source_doc_id")
-            for n in nodes
-            if n.metadata.get("source_doc_id")
-        ]
+        # Pair valid nodes with non-null embeddings
+        ready_to_sync: list[tuple[BaseNode, list[float]]] = []
+        for node, emb in zip(valid_nodes, valid_embeddings):
+            if emb is not None:
+                ready_to_sync.append((node, emb))
+
+        if not ready_to_sync:
+            logger.warning(
+                "LegacyTableSync: embedding generation failed for all valid nodes. "
+                "Skipping legacy sync."
+            )
+            return list(nodes)
+
+        # Collect distinct, non-empty source_doc_ids to scope deletions
+        scoped_source_ids: set[str] = set()
+        for node, _ in ready_to_sync:
+            sid = node.metadata.get("source_doc_id")
+            if not sid and node.node_id and "#" in node.node_id:
+                sid = node.node_id
+            if sid and isinstance(sid, str) and sid.strip():
+                scoped_source_ids.add(sid.strip())
 
         async with AsyncSessionLocal() as session:
-            # Delete only signatures belonging to the documents currently being ingested
-            if source_doc_ids:
+            # Source-scoped cleanup: ONLY delete records belonging to successfully extracted sources.
+            # Never issue a global DELETE FROM letter_type_memory or DELETE FROM signatures.
+            # Legacy records with NULL source_doc_id are strictly preserved.
+            for s_id in scoped_source_ids:
                 await session.execute(
-                    delete(Signature).where(Signature.source_doc_id.in_(source_doc_ids))
+                    delete(LetterTypeMemory).where(LetterTypeMemory.source_doc_id == s_id)
                 )
-            else:
-                await session.execute(delete(Signature))
-
-            # Re-sync LetterTypeMemory with newly extracted records
-            await session.execute(delete(LetterTypeMemory))
 
             existing_codes = await _load_existing_designations(session)
 
+            nodes_to_sync = [n for n, _ in ready_to_sync]
+            embs_to_sync = [emb for _, emb in ready_to_sync]
+
             added, designations_added = _sync_to_legacy_tables(
-                session, nodes, existing_codes, description_embeddings
+                session, nodes_to_sync, existing_codes, embs_to_sync
             )
+
+            # Synchronize signatures based on explicit extraction state
+            for node in nodes_to_sync:
+                source_doc_id = node.metadata.get("source_doc_id") or node.node_id
+                state, valid_sigs = _evaluate_signature_state(node)
+
+                if state == "SUCCESS":
+                    # State A: Replace existing signatures for this source atomically
+                    await session.execute(
+                        delete(Signature).where(Signature.source_doc_id == source_doc_id)
+                    )
+                    for sig in valid_sigs:
+                        session.add(
+                            Signature(
+                                id=uuid.uuid4().hex,
+                                source_doc_id=source_doc_id,
+                                image_url=sig["url"],
+                                name=sig.get("name"),
+                            )
+                        )
+                elif state == "CONFIRMED_EMPTY":
+                    # State B: Explicitly confirmed zero signatures — delete existing, insert nothing
+                    await session.execute(
+                        delete(Signature).where(Signature.source_doc_id == source_doc_id)
+                    )
+                elif state == "PRESERVE":
+                    # State C: Preserve existing signatures — do NOT delete or mutate
+                    pass
 
             await session.commit()
 
         logger.info(
-            "LegacyTableSync: created %d LetterTypeMemory records, "
-            "%d new Designations.",
+            "LegacyTableSync: source-scoped sync completed for %d source(s) "
+            "(%d LetterTypeMemory, %d new Designations).",
+            len(scoped_source_ids),
             added,
             designations_added,
         )
@@ -189,10 +314,12 @@ def _sync_to_legacy_tables(
             )
             continue
 
+        source_doc_id = meta.get("source_doc_id") or node.node_id
         memory = LetterTypeMemory(
             id=uuid.uuid4().hex,
+            source_doc_id=source_doc_id,
             letter_type=meta.get("letter_type"),
-            primary_domain=meta.get("primary_domain"),
+            primary_domain=meta.get("primary_domain") or "GENERAL",
             description=meta.get("description"),
             approval_chain=approval_chain,
             table_info=meta.get("table_info"),
@@ -201,24 +328,5 @@ def _sync_to_legacy_tables(
         )
         session.add(memory)
         added += 1
-
-        # 3. Signatures
-        signatures = meta.get("signatures", [])
-        source_doc_id = meta.get("source_doc_id", "")
-        if signatures:
-            for sig in signatures:
-                if sig.get("url"):
-                    session.add(
-                        Signature(
-                            id=uuid.uuid4().hex,
-                            source_doc_id=source_doc_id,
-                            image_url=sig["url"],
-                            name=sig.get("name"),
-                        )
-                    )
-                else:
-                    logger.warning(
-                        "LegacyTableSync: signature entry has no url: %s", sig
-                    )
 
     return added, designations_added
